@@ -1,0 +1,28 @@
+---
+env:
+    name: Ant-v2    # default arg, may be overwritten by command arguments
+    max_episode_steps: 1000
+    seed: 0
+agent:
+    algorithm: dagger   # default arg, may be overwritten by command arguments
+    batch_size: 32
+
+    # model path: model_root_dir/model_name
+    # tensorboard path: log_root_dir/model_name
+    model_root_dir: saved_models            # root path for savinng models
+    log_root_dir: logs  # root path for tensorboard logs
+    model_name: baseline
+    
+    num_epochs: 100000
+
+    network:
+        units: [128]
+        learning_rate: 1e-4
+
+    env_stats:
+        times: 1
+        stats: [score_mean, score_std]
+
+buffer:
+    filename: None # this will be filled in by main in train.py
+    capacity: 1e5
