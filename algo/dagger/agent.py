@@ -59,7 +59,7 @@ class Agent(Model):
         self.net = Network('Network', self.args['network'], self.graph, self.data['state'], self.env, self.name)
         self.action = self.net.action
         self.loss = self._loss(self.action, self.data['action'])
-        self.opt_op, _, _ = self.net._optimization_op(self.loss)
+        _, _, _, _, self.opt_op = self.net._optimization_op(self.loss)
 
         self._log_loss()
 

@@ -58,10 +58,10 @@ class Layer():
 
         return x
 
-    def dense_norm_activation(self, x, units, kernel_initializer=tf_utils.kaiming_initializer(),
+    def dense_norm_activation(self, x, units, use_bias=True, kernel_initializer=tf_utils.kaiming_initializer(),
                                norm=tc.layers.layer_norm, activation=tf.nn.relu, name=None):
         def layer_imp():
-            y = self.dense(x, units, kernel_initializer=kernel_initializer)
+            y = self.dense(x, units, use_bias=use_bias, kernel_initializer=kernel_initializer)
             y = tf_utils.norm_activation(y, norm=norm, activation=activation, 
                                         training=self.training)
 
@@ -372,50 +372,91 @@ class Layer():
 
         return x, (initial_state, final_state)
 
-    def lstm_norm(self, x, units, masks, norm=True):
-        kernel_initializer = tf_utils.kaiming_initializer() if norm else tc.layers.xavier_initializer()
-        xw_shape = [x.shape.as_list()[-1], units]
-        xb_shape = [units]
-        hw_shape = [units, units]
-        hb_shape = [units]
+    def lstm_norm(self, xs, units, masks=None):
+        """lstm with masks and layer normalization
+        reference code: https://github.com/openai/baselines/blob/8c2aea2addc9f3ba36d4a0c937e6a2d09830afc7/baselines/a2c/utils.py#L81
         
-        n_batch, n_steps = x.shape.as_list()[:2]
+        Arguments:
+            xs      3d Tensor   --  input data of shape [n_batch, n_seq, dim]
+            units   int         --  size of hidden/cell state
+            masks   2d Tensor   --  masks, must match the first 2 dimensions of xs
+        
+        Returns:
+            ys      3d Tensor   -- output date of shape [n_batch, n_seq, units]
+            initial_state, final_state
+        """
+        assert_colorize(len(xs.shape.as_list()) == 3, 
+                        f'Imput Shape Error: desire tensor of 3 dimensions, get {len(xs.shape.as_list())}')
 
-        ln = tc.layers.layer_norm
+        assert_colorize(masks is None or len(masks.shape.as_list()) == 2, 
+                        f'Masks Shape Error: desire None or tensor of 2 dimensions, get {len(masks.shape.as_list())}')
+        kernel_initializer = tf_utils.kaiming_initializer()
+        def ln(x, gamma, beta, eps=1e-5, axes=[1]):
+            mean, var = tf.nn.moments(x, axes=axes, keep_dims=True)
+            x = (x - mean) / tf.sqrt(var + eps)
+            x = gamma * x + beta
+            return x
 
+        n_batch, n_steps, x_dim = xs.shape.as_list()
+
+        xw_shape = [x_dim, 4*units]
+        xb_shape = [4*units]
+        hw_shape = [units, 4*units]
+        hb_shape = [4*units]
+        
         with tf.variable_scope('lstm_norm'):
             x_w = tf.get_variable('x_w', shape=xw_shape, 
                                   initializer=kernel_initializer,
                                   regularizer=self.l2_regularizer)
+            x_g = tf.get_variable('x_g', [4*units], 
+                                  initializer=tf.constant_initializer(1.0))
             x_b = tf.get_variable('x_b', shape=xb_shape, 
                                   initializer=tf.zeros_initializer())
             
             h_w = tf.get_variable('h_w', shape=hw_shape, 
                                   initializer=kernel_initializer,
                                   regularizer=self.l2_regularizer)
+            h_g = tf.get_variable('h_g', [4*units], 
+                                  initializer=tf.constant_initializer(1.0))
             h_b = tf.get_variable('h_b', shape=hb_shape, 
                                   initializer=tf.zeros_initializer())
 
+            b = tf.get_variable('b', [4*units], 
+                                initializer=tf.zeros_initializer())
+        
+            c_g = tf.get_variable('c_g', [units], 
+                                  initializer=tf.constant_initializer(1.0))
+            c_b = tf.get_variable('c_b', [units], 
+                                  initializer=tf.zeros_initializer())
+            
             initial_state = tf.zeros([n_batch, 2*units], name='initial_state')
-            h, c = tf.split(value=initial_state, num_or_size_splits=2, axis=1)
-            xs = [tf.squeeze(v, [1]) for v in tf.split(value=x, num_or_size_splits=n_steps, axis=1)]
-            for idx, (x, m) in enumerate(zip(xs, masks)):
-                c *= 1-m
-                h *= 1-m
-                z = ln(tf.matmul(x, x_w) + x_b) + ln(tf.matmul(h, h_w) + h_b)
+            initial_state = tf.split(value=initial_state, num_or_size_splits=2, axis=1)
+            h, c = initial_state
+            xs = tf.unstack(xs, n_steps, axis=1)
+            if masks is not None:
+                masks = tf.unstack(masks, n_steps, axis=1)
+
+            ys = []
+            for x in xs if masks is None else zip(xs, masks):
+                if masks is not None:
+                    x, m = x
+                    m = m[..., None]
+                    c *= m
+                    h *= m
+                z = ln(tf.matmul(x, x_w), x_g, x_b) + ln(tf.matmul(h, h_w), h_g, h_b) + b
                 f, i, o, u = tf.split(value=z, num_or_size_splits=4, axis=1)
                 f = tf.nn.sigmoid(f)
                 i = tf.nn.sigmoid(i)
                 o = tf.nn.sigmoid(o)
                 u = tf.tanh(u)
                 c = f * c + i * u
-                h = o * tf.tanh(ln(c))
-                xs[idx] = h
+                h = o * tf.tanh(ln(c, c_g, c_b))
+                ys.append(h)
             
             final_state = (h, c)
-            xs = tf.stack(xs, 1)
+            ys = tf.stack(ys, 1)
 
-        return xs, (initial_state, final_state)
+        return ys, (initial_state, final_state)
 
     def attention(self, q, k, v, mask=None):
         # softmax(QK^T/)V
@@ -427,8 +468,8 @@ class Layer():
         # Test code to monitor saturation of softmax
         if hasattr(self, 'log_params') and self.log_params:
             with tf.name_scope('attention'):
-                tf_utils.stats_summary(weights, 'softmax', hist=True)
-                tf_utils.stats_summary(x, 'output')
+                tf_utils.stats_summary('softmax', weights, hist=True)
+                tf_utils.stats_summary('output', x)
         
         return x
 
